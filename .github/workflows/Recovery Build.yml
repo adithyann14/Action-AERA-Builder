@@ -1,207 +1,236 @@
-name: Recovery Build
+name: Build AERA sky
 
 on:
   workflow_dispatch:
     inputs:
+      device_tree_url:
+        description: "Device tree repository"
+        required: true
+        default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
+        type: string
 
       device_tree_branch:
-        description: "Select Device Tree branch"
+        description: "Device tree branch"
         required: true
-        default: "aera-16.0"
-        type: choice
-        options:
-          - "aera-16.0"
-          - auto-dfe
-
-      notification_mode:
-        description: "Select Telegram notification mode"
-        required: true
-        type: choice
-        default: quiet
-        options:
-          - quiet
-          - loud
+        default: fox_16.0
+        type: string
 
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
     permissions:
       contents: write
 
     env:
       SYNC_URL: https://github.com/AERA-Recovery/android_manifest.git
       MANIFEST_BRANCH: "aera-16.0"
-      DEVICE_TREE_URL: https://github.com/AzzyC/android_device_xiaomi_peridot-AERA
+      SRC_DIR: aera
+      DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
       DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
-      DEVICE_PATH: device/xiaomi/peridot
-      DEVICE_NAME: peridot
-      MAKEFILE_NAME: twrp_peridot-bp2a-eng
+      DEVICE_TREE_WEB: https://github.com/Adithy4n/recovery_device_xiaomi_sky
+      DEVICE_PATH: device/xiaomi/sky
+      DEVICE_NAME: sky
+      MAKEFILE_NAME: twrp_sky-bp2a-eng
       BUILD_TARGET: recovery
-      TELEGRAM_CHAT_ID: ${{ inputs.notification_mode == 'quiet' && '-1002917930475' || '-1001480977582' }}
-      TZ: Europe/London
+      TZ: Asia/Kolkata
 
     steps:
-
-    # Cleanup The Actions Workspace Using Custom Composite Run Actions
     - name: Cleanup
       uses: rokibhasansagar/slimhub_actions@main
 
-    - name: Create Telegram sender script
-      run: |
-        cat <<'EOF' > /tmp/send_msg.sh
-        #!/bin/bash
-        MSG="$(printf "$1")"
-        curl -s --fail \
-          -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-          -d chat_id="${{ env.TELEGRAM_CHAT_ID }}" \
-          -d text="$MSG" \
-          -d parse_mode="Markdown" \
-          -d disable_web_page_preview=true \
-        > /dev/null 2>&1 || true
-        EOF
-        chmod +x /tmp/send_msg.sh
-
-    - name: Initialize workspace
-      run: |
-        /tmp/send_msg.sh "🚀 *Starting AERA build* for \`${{ env.DEVICE_NAME }}\` (\`${{ env.DEVICE_TREE_BRANCH }}\`)\n🔗 [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-        mkdir workspace
-        cd workspace
-        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
-      id: pwd
-
     - name: Prepare the build environment
       run: |
-        /tmp/send_msg.sh "🧩 Preparing build environment..."
+        sudo apt-get update
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+          git python3 tar aria2 ccache
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+          linux-modules-extra-$(uname -r) || \
+          echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
         curl -fL -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
         sudo bash android_build_env.sh
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Install OpenJDK
       uses: actions/setup-java@v6
       with:
         distribution: 'zulu'
-        java-version: '11'
+        java-version: '17'
 
-    # - name: Setup SSH Keys
-    #   uses: webfactory/ssh-agent@v0.10.0
-    #   with:
-    #     ssh-private-key: ${{ secrets.HUB_SSH_PRIVATE_KEY }}
-
-    # - name: Add GitHub to known hosts
-    #   run: |
-    #     mkdir -p ~/.ssh
-    #     ssh-keyscan github.com >> ~/.ssh/known_hosts
-
-    - name: Sync AERA sources and minimal manifest
+    - name: Sync AERA sources
       run: |
-        /tmp/send_msg.sh "🌐 Syncing AERA sources..."
-        mkdir ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }} && \
-          cd ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}
+        mkdir -p "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
+        cd "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
         repo init --depth=1 -u ${{ env.SYNC_URL }} -b ${{ env.MANIFEST_BRANCH }}
         repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    - name: Get latest bootable/recovery commit
+    - name: AERA - blank screen on boot only for non-NVT panels
+      run: |
+        # TW_SCREEN_BLANK_ON_BOOT (gui/gui.cpp, gui_init) blanks and unblanks
+        # the panel at recovery start. FTS panels (m19_42_*) need that, but on
+        # NVT panels (m19_36_*) it collides with the touch-FW load and breaks
+        # the display. Keep the flag true in BoardConfig; skip the cycle at
+        # runtime when an NVT panel is detected:
+        #   1) /proc/cmdline msm_drm.dsi_display0=...m19_36 / m19_42...
+        #   2) fallback: /proc/NVTSPI or /proc/nvt_fw_version exists
+        python3 - <<'PY'
+        import re, sys
+        from pathlib import Path
+
+        f = Path("${{ env.SRC_DIR }}/bootable/recovery/gui/gui.cpp")
+        s = f.read_text()
+        if "AERA_NVT_BLANK_ON_BOOT_PATCH" in s:
+            sys.exit(0)
+
+        helper = '''/* AERA_NVT_BLANK_ON_BOOT_PATCH */
+        static bool aera_panel_is_nvt(void)
+        {
+        	char b[4096] = {0};
+        	FILE *f = fopen("/proc/cmdline", "r");
+        	if (f) {
+        		size_t n = fread(b, 1, sizeof(b) - 1, f);
+        		b[n] = 0;
+        		fclose(f);
+        		if (strstr(b, "m19_36") || strstr(b, "n19_36"))
+        			return true;
+        		if (strstr(b, "m19_42") || strstr(b, "n19_42"))
+        			return false;
+        	}
+        	return access("/proc/NVTSPI", F_OK) == 0 ||
+        		access("/proc/nvt_fw_version", F_OK) == 0;
+        }
+
+        '''
+
+        # 1) helper right before gui_init
+        anchor = 'extern "C" int gui_init(void)'
+        if s.count(anchor) != 1:
+            sys.exit("::error::gui_init anchor not found exactly once in AERA gui.cpp")
+        s = s.replace(anchor, helper + anchor, 1)
+
+        # 2) wrap the blank/unblank cycle
+        pat = re.compile(
+            r'(#ifdef TW_SCREEN_BLANK_ON_BOOT\s*\n)'
+            r'(\s*printf\("TW_SCREEN_BLANK_ON_BOOT := true\\n"\);\s*\n)'
+            r'(\s*blankTimer\.blank\(\);\s*\n)'
+            r'(\s*blankTimer\.resetTimerAndUnblank\(\);\s*\n)'
+            r'(#endif)')
+        m = pat.search(s)
+        if not m:
+            print("lines mentioning the flag in AERA gui.cpp:")
+            for i, l in enumerate(s.split("\n"), 1):
+                if "BLANK_ON_BOOT" in l or "blankTimer" in l:
+                    print(f"  {i}: {l}")
+            sys.exit("::error::TW_SCREEN_BLANK_ON_BOOT block in gui_init differs in AERA, update the patch")
+        new = (m.group(1) +
+               "\tif (aera_panel_is_nvt()) {\n"
+               "\t\tprintf(\"NVT panel detected, skipping blank-on-boot\\n\");\n"
+               "\t} else {\n"
+               "\t\tprintf(\"TW_SCREEN_BLANK_ON_BOOT := true\\n\");\n"
+               "\t\tblankTimer.blank();\n"
+               "\t\tblankTimer.resetTimerAndUnblank();\n"
+               "\t}\n" + m.group(5))
+        s = s[:m.start()] + new + s[m.end():]
+        f.write_text(s)
+        print("patched", f)
+        PY
+        grep -n -B2 -A12 "aera_panel_is_nvt()" "${{ env.SRC_DIR }}/bootable/recovery/gui/gui.cpp"
+
+    - name: Get bootable/recovery commit
       id: recovery_commit
       run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}/bootable/recovery
-        RECOVERY_COMMIT=$(git rev-parse --short=7 HEAD)
-        echo "RECOVERY_COMMIT=$RECOVERY_COMMIT" >> $GITHUB_OUTPUT
-        echo "Latest bootable/recovery commit: $RECOVERY_COMMIT"
-        /tmp/send_msg.sh "🔁 bootable/recovery: [${RECOVERY_COMMIT}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${RECOVERY_COMMIT})"
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        cd "${{ env.SRC_DIR }}/bootable/recovery"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "bootable/recovery: $COMMIT"
 
     - name: Clone device tree
       run: |
-        /tmp/send_msg.sh "🌲 Cloning device tree for \`${{ env.DEVICE_NAME }}\`..."
-        cd ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}
-        mkdir -p ${{ env.DEVICE_PATH }}
-        git clone --depth=1 ${{ env.DEVICE_TREE_URL }} -b ${{ env.DEVICE_TREE_BRANCH }} ./${{ env.DEVICE_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        git clone --depth=1 "${{ env.DEVICE_TREE_URL }}" \
+          -b "${{ env.DEVICE_TREE_BRANCH }}" \
+          "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
 
-    - name: Get latest device tree commit
+    - name: Get device tree commit
       id: devtree_commit
       run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}/${{ env.DEVICE_PATH }}
-        LATEST_COMMIT=$(git rev-parse --short=7 HEAD)
-        echo "LATEST_COMMIT=$LATEST_COMMIT" >> $GITHUB_OUTPUT
-        echo "Latest device tree commit: $LATEST_COMMIT"
-        /tmp/send_msg.sh "🌲 Device tree: [${LATEST_COMMIT}](${{ env.DEVICE_TREE_URL }}/tree/$LATEST_COMMIT)"
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        cd "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "device tree: $COMMIT"
 
-    - name: Set Swap Space
+    - name: Set swap space
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 30
 
     - name: Show system resources
       run: |
-        /tmp/send_msg.sh "📊 Checking runner resources..."
-        echo "CPU cores:"
-        nproc
-        echo
-        echo "Memory:"
-        free -h
-        echo
-        echo "Disk:"
-        df -h
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        nproc && free -h && df -h
 
-    - name: Building recovery
+    - name: Build recovery
+      timeout-minutes: 240
       run: |
-        /tmp/send_msg.sh "⚙️ Starting build for \`${{ env.DEVICE_NAME }}\`..."
-        cd ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}
+        cd "${{ env.SRC_DIR }}"
 
         set +e
         source build/envsetup.sh
-        export ALLOW_MISSING_DEPENDENCIES=true
         set -e
 
+        export ALLOW_MISSING_DEPENDENCIES=true
         lunch ${{ env.MAKEFILE_NAME }}
 
-        if ! mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all); then
-          /tmp/send_msg.sh "❌ Build failed for \`${{ env.DEVICE_NAME }}\` (\`${{ env.DEVICE_TREE_BRANCH }}\`)\n🔗 [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-          exit 1
-        fi
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
 
-    - name: Show system resources post-build
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          ${{ env.SRC_DIR }}/out/error.log
+          ${{ env.SRC_DIR }}/out/verbose.log.gz
+          ${{ env.SRC_DIR }}/out/soong.log
+        if-no-files-found: ignore
+
+    - name: Verify the flashable zip
       run: |
-        /tmp/send_msg.sh "📊 Checking runner resources after build..."
-        echo "CPU cores:"
-        nproc
-        echo
-        echo "Memory:"
-        free -h
-        echo
-        echo "Disk:"
-        df -h
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+        set +e
+        D="${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}"
+        rc=0
+        shopt -s nullglob
+        for z in "$D"/AERA-R*.zip; do
+          echo "### $(basename "$z"): $(stat -c%s "$z") bytes"
+          if unzip -t "$z" > /tmp/zt.log 2>&1; then
+            echo "### zip integrity: OK"
+          else
+            echo "### zip integrity: CORRUPT"
+            tail -30 /tmp/zt.log
+            rc=1
+          fi
+          ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
+        done
+        [ $rc -eq 0 ] || { echo "Flashable zip failed unzip -t"; exit 1; }
 
-    - name: Upload to Release
+    - name: Check the output directory
+      run: ls -l "${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/"
+
+    - name: Upload to release
       uses: softprops/action-gh-release@v3
       with:
         files: |
-          ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.img
-          ${{ steps.pwd.outputs.workspace-folder }}/${{ env.MANIFEST_BRANCH }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip
-        fail_on_unmatched_files: true
-        name: ${{ env.DEVICE_NAME }}-${{ env.DEVICE_TREE_BRANCH }}-${{ steps.devtree_commit.outputs.LATEST_COMMIT }}
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.img
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip.md5
+        fail_on_unmatched_files: false
+        name: ${{ env.DEVICE_NAME }}-${{ env.DEVICE_TREE_BRANCH }}-${{ steps.devtree_commit.outputs.commit }}
         tag_name: ${{ github.run_id }}
         body: |
           Manifest: ${{ env.MANIFEST_BRANCH }}
           Device: ${{ env.DEVICE_NAME }}
           Target: ${{ env.BUILD_TARGET }}
+          Lunch: ${{ env.MAKEFILE_NAME }}
           Device tree branch: ${{ env.DEVICE_TREE_BRANCH }}
-          Device tree commit: [${{ steps.devtree_commit.outputs.LATEST_COMMIT }}](${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.LATEST_COMMIT }})
-          bootable/recovery commit: [${{ steps.recovery_commit.outputs.RECOVERY_COMMIT }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.RECOVERY_COMMIT }})
+          Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
+          bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.commit }})
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Notify Release
-      if: success()
-      run: |
-        RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ github.run_id }}"
-        DEVICE_TREE_BROWSE_URL="${{ env.DEVICE_TREE_URL }}/tree/${{ steps.devtree_commit.outputs.LATEST_COMMIT }}"
-        RECOVERY_BROWSE_URL="https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.RECOVERY_COMMIT }}"
-        /tmp/send_msg.sh "📦 *Build complete!*\n🔗 [Download]($RELEASE_URL)\n🌲 Device tree branch: \`${{ env.DEVICE_TREE_BRANCH }}\`\n🌲 Device tree commit: [${{ steps.devtree_commit.outputs.LATEST_COMMIT }}]($DEVICE_TREE_BROWSE_URL)\n🔁 bootable/recovery commit: [${{ steps.recovery_commit.outputs.RECOVERY_COMMIT }}]($RECOVERY_BROWSE_URL)"
