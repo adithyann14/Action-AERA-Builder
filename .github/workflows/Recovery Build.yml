@@ -66,75 +66,78 @@ jobs:
 
     - name: AERA - blank screen on boot only for non-NVT panels
       run: |
-        # TW_SCREEN_BLANK_ON_BOOT (gui/gui.cpp, gui_init) blanks and unblanks
-        # the panel at recovery start. FTS panels (m19_42_*) need that, but on
-        # NVT panels (m19_36_*) it collides with the touch-FW load and breaks
-        # the display. Keep the flag true in BoardConfig; skip the cycle at
-        # runtime when an NVT panel is detected:
+        # TW_SCREEN_BLANK_ON_BOOT (aeraui/platform/aera_ui_host.cpp, gui_init)
+        # blanks and wakes the panel at recovery start. FTS panels (m19_42_*)
+        # need that, but on NVT panels (m19_36_*) it collides with the
+        # touch-FW load and breaks the display. Keep the flag true in
+        # BoardConfig; skip the cycle at runtime when an NVT panel is found:
         #   1) /proc/cmdline msm_drm.dsi_display0=...m19_36 / m19_42...
         #   2) fallback: /proc/NVTSPI or /proc/nvt_fw_version exists
         python3 - <<'PY'
         import re, sys
         from pathlib import Path
 
-        f = Path("${{ env.SRC_DIR }}/bootable/recovery/gui/gui.cpp")
+        f = Path("${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp")
         s = f.read_text()
         if "AERA_NVT_BLANK_ON_BOOT_PATCH" in s:
             sys.exit(0)
 
+        def fail(msg):
+            print("lines mentioning blank / the flag in", f)
+            for i, l in enumerate(s.split("\n"), 1):
+                if "BLANK_ON_BOOT" in l or "Blank(" in l or "Wake(" in l:
+                    print(f"  {i}: {l}")
+            sys.exit("::error::" + msg)
+
         helper = '''/* AERA_NVT_BLANK_ON_BOOT_PATCH */
-        static bool aera_panel_is_nvt(void)
-        {
-        	char b[4096] = {0};
-        	FILE *f = fopen("/proc/cmdline", "r");
-        	if (f) {
-        		size_t n = fread(b, 1, sizeof(b) - 1, f);
-        		b[n] = 0;
-        		fclose(f);
-        		if (strstr(b, "m19_36") || strstr(b, "n19_36"))
-        			return true;
-        		if (strstr(b, "m19_42") || strstr(b, "n19_42"))
-        			return false;
-        	}
-        	return access("/proc/NVTSPI", F_OK) == 0 ||
-        		access("/proc/nvt_fw_version", F_OK) == 0;
+        static bool aera_panel_is_nvt() {
+          char b[4096] = {0};
+          std::ifstream f("/proc/cmdline");
+          if (f) {
+            f.read(b, sizeof(b) - 1);
+            b[f.gcount()] = 0;
+            if (std::strstr(b, "m19_36") || std::strstr(b, "n19_36")) return true;
+            if (std::strstr(b, "m19_42") || std::strstr(b, "n19_42")) return false;
+          }
+          return access("/proc/NVTSPI", F_OK) == 0 ||
+                 access("/proc/nvt_fw_version", F_OK) == 0;
         }
 
         '''
 
-        # 1) helper right before gui_init
-        anchor = 'extern "C" int gui_init(void)'
+        # 1) unistd.h for access()
+        inc = "#include <iterator>\n"
+        if s.count(inc) != 1:
+            fail("#include <iterator> anchor not found exactly once")
+        s = s.replace(inc, inc + "#include <unistd.h>\n", 1)
+
+        # 2) helper right before gui_init
+        anchor = 'extern "C" int gui_init() {'
         if s.count(anchor) != 1:
-            sys.exit("::error::gui_init anchor not found exactly once in AERA gui.cpp")
+            fail("gui_init anchor not found exactly once")
         s = s.replace(anchor, helper + anchor, 1)
 
-        # 2) wrap the blank/unblank cycle
+        # 3) wrap the blank/wake cycle
         pat = re.compile(
-            r'(#ifdef TW_SCREEN_BLANK_ON_BOOT\s*\n)'
-            r'(\s*printf\("TW_SCREEN_BLANK_ON_BOOT := true\\n"\);\s*\n)'
-            r'(\s*blankTimer\.blank\(\);\s*\n)'
-            r'(\s*blankTimer\.resetTimerAndUnblank\(\);\s*\n)'
+            r'(#ifdef TW_SCREEN_BLANK_ON_BOOT[ \t]*\n)'
+            r'([ \t]*aeraScreenTimer\.Blank\(\);[ \t]*\n)'
+            r'([ \t]*aeraScreenTimer\.Wake\(\);[ \t]*\n)'
             r'(#endif)')
         m = pat.search(s)
         if not m:
-            print("lines mentioning the flag in AERA gui.cpp:")
-            for i, l in enumerate(s.split("\n"), 1):
-                if "BLANK_ON_BOOT" in l or "blankTimer" in l:
-                    print(f"  {i}: {l}")
-            sys.exit("::error::TW_SCREEN_BLANK_ON_BOOT block in gui_init differs in AERA, update the patch")
+            fail("TW_SCREEN_BLANK_ON_BOOT block in gui_init differs, update the patch")
         new = (m.group(1) +
-               "\tif (aera_panel_is_nvt()) {\n"
-               "\t\tprintf(\"NVT panel detected, skipping blank-on-boot\\n\");\n"
-               "\t} else {\n"
-               "\t\tprintf(\"TW_SCREEN_BLANK_ON_BOOT := true\\n\");\n"
-               "\t\tblankTimer.blank();\n"
-               "\t\tblankTimer.resetTimerAndUnblank();\n"
-               "\t}\n" + m.group(5))
+               "  if (aera_panel_is_nvt()) {\n"
+               '    gui_print("I:NVT panel detected, skipping blank-on-boot.\\n");\n'
+               "  } else {\n"
+               "    aeraScreenTimer.Blank();\n"
+               "    aeraScreenTimer.Wake();\n"
+               "  }\n" + m.group(4))
         s = s[:m.start()] + new + s[m.end():]
         f.write_text(s)
         print("patched", f)
         PY
-        grep -n -B2 -A12 "aera_panel_is_nvt()" "${{ env.SRC_DIR }}/bootable/recovery/gui/gui.cpp"
+        grep -n -B2 -A10 "aera_panel_is_nvt()" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp"
 
     - name: Get bootable/recovery commit
       id: recovery_commit
