@@ -1,4 +1,4 @@
-name: Build AERA sky
+name: Build AERA sky sim2
 
 on:
   workflow_dispatch:
