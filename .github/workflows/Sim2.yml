@@ -1,0 +1,325 @@
+name: Build AERA sky
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_tree_url:
+        description: "Device tree repository"
+        required: true
+        default: https://github.com/Adithy4n/recovery_device_xiaomi_sky.git
+        type: string
+
+      device_tree_branch:
+        description: "Device tree branch"
+        required: true
+        default: Abort
+        type: string
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      SYNC_URL: https://github.com/AERA-Recovery/android_manifest.git
+      MANIFEST_BRANCH: "aera-16.0"
+      SRC_DIR: aera
+      DEVICE_TREE_URL: ${{ inputs.device_tree_url }}
+      DEVICE_TREE_BRANCH: ${{ inputs.device_tree_branch }}
+      DEVICE_TREE_WEB: https://github.com/Adithy4n/recovery_device_xiaomi_sky
+      DEVICE_PATH: device/xiaomi/sky
+      DEVICE_NAME: sky
+      MAKEFILE_NAME: twrp_sky-bp2a-eng
+      BUILD_TARGET: recovery
+      TZ: Asia/Kolkata
+
+    steps:
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Prepare the build environment
+      run: |
+        sudo apt-get update
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+          git python3 tar aria2 ccache
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -yq \
+          linux-modules-extra-$(uname -r) || \
+          echo "linux-modules-extra-$(uname -r) unavailable; continuing without it"
+        curl -fL -O "https://gitlab.com/OrangeFox/misc/scripts/-/raw/master/setup/android_build_env.sh"
+        sudo bash android_build_env.sh
+
+    - name: Install OpenJDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Sync AERA sources
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
+        cd "$GITHUB_WORKSPACE/${{ env.SRC_DIR }}"
+        repo init --depth=1 -u ${{ env.SYNC_URL }} -b ${{ env.MANIFEST_BRANCH }}
+        repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
+
+    - name: AERA - rmtfs, dump the unknown request payload and unbuffer logs (diagnostic)
+      run: |
+        # The modem sends QMI request 7 to rmtfs and gets no reply. Print what it
+        # is (sender + first 64 bytes) instead of only "Unknown request: 7", and
+        # make stdout/stderr unbuffered so the last lines before a hang reach the
+        # log file. Finds rmtfs.c wherever the manifest put it. No reply is sent.
+        python3 - <<'PY'
+        import os, re, sys
+        from pathlib import Path
+
+        root = Path("${{ env.SRC_DIR }}")
+        skip = {"out", ".repo", ".git"}
+        found = []
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if x not in skip]
+            if "rmtfs.c" in files:
+                p = Path(d) / "rmtfs.c"
+                if "[RMTFS] Unknown request" in p.read_text(errors="ignore"):
+                    found.append(p)
+        print("rmtfs.c candidates:", [str(p) for p in found])
+        if not found:
+            sys.exit("::error::no rmtfs.c with an 'Unknown request' message found in the tree")
+
+        pat = re.compile(
+            r'^([ \t]*)fprintf\(stderr,\s*"\[RMTFS\] Unknown request: %d\\n",\s*msg_id\);[ \t]*\n',
+            re.M)
+        getopt_anchor = '\twhile ((option = getopt(argc, argv, "o:S:Prsv")) != -1) {'
+
+        for p in found:
+            s = p.read_text()
+
+            # 1) request dump
+            if "AERA_RMTFS_REQ_DUMP" not in s:
+                m = pat.search(s)
+                if not m:
+                    print("lines mentioning Unknown request in", p)
+                    for i, l in enumerate(s.split("\n"), 1):
+                        if "Unknown request" in l:
+                            print(f"  {i}: {l}")
+                    sys.exit("::error::Unknown-request fprintf differs, update the patch")
+                ind = m.group(1)
+                new = (
+                    f'{ind}/* AERA_RMTFS_REQ_DUMP */\n'
+                    f'{ind}{{\n'
+                    f'{ind}  size_t i, n = pkt.data_len < 64 ? pkt.data_len : 64;\n'
+                    f'{ind}  fprintf(stderr, "[RMTFS] Unknown request: %d from %u:%u len=%zu data=",\n'
+                    f'{ind}          msg_id, pkt.node, pkt.port, (size_t)pkt.data_len);\n'
+                    f'{ind}  for (i = 0; i < n; i++)\n'
+                    f'{ind}    fprintf(stderr, "%02x", ((const unsigned char *)pkt.data)[i]);\n'
+                    f'{ind}  fprintf(stderr, "\\n");\n'
+                    f'{ind}  if (msg_id == 7 && pkt.data_len >= 3) {{\n'
+                    f'{ind}    /* EXPERIMENT: answer request 7 with an empty success response */\n'
+                    f'{ind}    const unsigned char *b = (const unsigned char *)pkt.data;\n'
+                    f'{ind}    struct rmtfs_close_resp ack = {{}};\n'
+                    f'{ind}    DEFINE_QRTR_PACKET(ack_buf, 256);\n'
+                    f'{ind}    unsigned ack_txn = b[1] | (b[2] << 8);\n'
+                    f'{ind}    ssize_t ack_len = qmi_encode_message(&ack_buf, QMI_RESPONSE, msg_id,\n'
+                    f'{ind}                                         ack_txn, &ack, rmtfs_close_resp_ei);\n'
+                    f'{ind}    if (ack_len >= 0) {{\n'
+                    f'{ind}      int r = qrtr_sendto(sock, pkt.node, pkt.port, ack_buf.data, ack_buf.data_len);\n'
+                    f'{ind}      fprintf(stderr, "[RMTFS] replied empty-success to request 7 (txn %u): %d\\n", ack_txn, r);\n'
+                    f'{ind}    }}\n'
+                    f'{ind}  }}\n'
+                    f'{ind}}}\n')
+                s = s[:m.start()] + new + s[m.end():]
+                print("request dump added", p)
+            else:
+                print("request dump already present", p)
+
+            # 2) unbuffered stdio (dbgprintf uses stdout, block-buffered into a file)
+            if "AERA_RMTFS_UNBUF" not in s:
+                if s.count(getopt_anchor) != 1:
+                    sys.exit("::error::getopt anchor not found exactly once in " + str(p))
+                s = s.replace(getopt_anchor,
+                    '\t/* AERA_RMTFS_UNBUF */\n'
+                    '\tsetvbuf(stdout, NULL, _IONBF, 0);\n'
+                    '\tsetvbuf(stderr, NULL, _IONBF, 0);\n\n' + getopt_anchor, 1)
+                print("unbuffered stdio added", p)
+            else:
+                print("unbuffered stdio already present", p)
+
+            p.write_text(s)
+        PY
+        grep -rn -B2 -A9 -E "AERA_RMTFS_(REQ_DUMP|UNBUF)" "${{ env.SRC_DIR }}" \
+          --include=rmtfs.c --exclude-dir=out --exclude-dir=.repo
+
+    - name: AERA - blank screen on boot only for non-NVT panels
+      run: |
+        # TW_SCREEN_BLANK_ON_BOOT (aeraui/platform/aera_ui_host.cpp, gui_init)
+        # blanks and wakes the panel at recovery start. FTS panels (m19_42_*)
+        # need that, but on NVT panels (m19_36_*) it collides with the
+        # touch-FW load and breaks the display. Keep the flag true in
+        # BoardConfig; skip the cycle at runtime when an NVT panel is found:
+        #   1) /proc/cmdline msm_drm.dsi_display0=...m19_36 / m19_42...
+        #   2) fallback: /proc/NVTSPI or /proc/nvt_fw_version exists
+        python3 - <<'PY'
+        import re, sys
+        from pathlib import Path
+
+        f = Path("${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp")
+        s = f.read_text()
+        if "AERA_NVT_BLANK_ON_BOOT_PATCH" in s:
+            sys.exit(0)
+
+        def fail(msg):
+            print("lines mentioning blank / the flag in", f)
+            for i, l in enumerate(s.split("\n"), 1):
+                if "BLANK_ON_BOOT" in l or "Blank(" in l or "Wake(" in l:
+                    print(f"  {i}: {l}")
+            sys.exit("::error::" + msg)
+
+        helper = '''/* AERA_NVT_BLANK_ON_BOOT_PATCH */
+        static bool aera_panel_is_nvt() {
+          char b[4096] = {0};
+          std::ifstream f("/proc/cmdline");
+          if (f) {
+            f.read(b, sizeof(b) - 1);
+            b[f.gcount()] = 0;
+            if (std::strstr(b, "m19_36") || std::strstr(b, "n19_36")) return true;
+            if (std::strstr(b, "m19_42") || std::strstr(b, "n19_42")) return false;
+          }
+          return access("/proc/NVTSPI", F_OK) == 0 ||
+                 access("/proc/nvt_fw_version", F_OK) == 0;
+        }
+
+        '''
+
+        # 1) unistd.h for access()
+        inc = "#include <iterator>\n"
+        if s.count(inc) != 1:
+            fail("#include <iterator> anchor not found exactly once")
+        s = s.replace(inc, inc + "#include <unistd.h>\n", 1)
+
+        # 2) helper right before gui_init
+        anchor = 'extern "C" int gui_init() {'
+        if s.count(anchor) != 1:
+            fail("gui_init anchor not found exactly once")
+        s = s.replace(anchor, helper + anchor, 1)
+
+        # 3) wrap the blank/wake cycle
+        pat = re.compile(
+            r'(#ifdef TW_SCREEN_BLANK_ON_BOOT[ \t]*\n)'
+            r'([ \t]*aeraScreenTimer\.Blank\(\);[ \t]*\n)'
+            r'([ \t]*aeraScreenTimer\.Wake\(\);[ \t]*\n)'
+            r'(#endif)')
+        m = pat.search(s)
+        if not m:
+            fail("TW_SCREEN_BLANK_ON_BOOT block in gui_init differs, update the patch")
+        new = (m.group(1) +
+               "  if (aera_panel_is_nvt()) {\n"
+               '    gui_print("I:NVT panel detected, skipping blank-on-boot.\\n");\n'
+               "  } else {\n"
+               "    aeraScreenTimer.Blank();\n"
+               "    aeraScreenTimer.Wake();\n"
+               "  }\n" + m.group(4))
+        s = s[:m.start()] + new + s[m.end():]
+        f.write_text(s)
+        print("patched", f)
+        PY
+        grep -n -B2 -A10 "aera_panel_is_nvt()" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp"
+
+    - name: Get bootable/recovery commit
+      id: recovery_commit
+      run: |
+        cd "${{ env.SRC_DIR }}/bootable/recovery"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "bootable/recovery: $COMMIT"
+
+    - name: Clone device tree
+      run: |
+        git clone --depth=1 "${{ env.DEVICE_TREE_URL }}" \
+          -b "${{ env.DEVICE_TREE_BRANCH }}" \
+          "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+
+    - name: Get device tree commit
+      id: devtree_commit
+      run: |
+        cd "${{ env.SRC_DIR }}/${{ env.DEVICE_PATH }}"
+        COMMIT=$(git rev-parse --short=7 HEAD)
+        echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+        echo "device tree: $COMMIT"
+
+    - name: Set swap space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 30
+
+    - name: Show system resources
+      run: |
+        nproc && free -h && df -h
+
+    - name: Build recovery
+      timeout-minutes: 240
+      run: |
+        cd "${{ env.SRC_DIR }}"
+
+        set +e
+        source build/envsetup.sh
+        set -e
+
+        export ALLOW_MISSING_DEPENDENCIES=true
+        lunch ${{ env.MAKEFILE_NAME }}
+
+        mka adbd ${{ env.BUILD_TARGET }}image -j$(nproc --all)
+
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          ${{ env.SRC_DIR }}/out/error.log
+          ${{ env.SRC_DIR }}/out/verbose.log.gz
+          ${{ env.SRC_DIR }}/out/soong.log
+        if-no-files-found: ignore
+
+    - name: Verify the flashable zip
+      run: |
+        set +e
+        D="${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}"
+        rc=0
+        shopt -s nullglob
+        for z in "$D"/AERA-R*.zip; do
+          echo "### $(basename "$z"): $(stat -c%s "$z") bytes"
+          if unzip -t "$z" > /tmp/zt.log 2>&1; then
+            echo "### zip integrity: OK"
+          else
+            echo "### zip integrity: CORRUPT"
+            tail -30 /tmp/zt.log
+            rc=1
+          fi
+          ( cd "$(dirname "$z")" && md5sum "$(basename "$z")" | tee "$(basename "$z").md5" )
+        done
+        [ $rc -eq 0 ] || { echo "Flashable zip failed unzip -t"; exit 1; }
+
+    - name: Check the output directory
+      run: ls -l "${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/"
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: |
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.img
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip
+          ${{ env.SRC_DIR }}/out/target/product/${{ env.DEVICE_NAME }}/AERA-R*.zip.md5
+        fail_on_unmatched_files: false
+        name: ${{ env.DEVICE_NAME }}-${{ env.DEVICE_TREE_BRANCH }}-${{ steps.devtree_commit.outputs.commit }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ env.MANIFEST_BRANCH }}
+          Device: ${{ env.DEVICE_NAME }}
+          Target: ${{ env.BUILD_TARGET }}
+          Lunch: ${{ env.MAKEFILE_NAME }}
+          Device tree branch: ${{ env.DEVICE_TREE_BRANCH }}
+          Device tree commit: [${{ steps.devtree_commit.outputs.commit }}](${{ env.DEVICE_TREE_WEB }}/tree/${{ steps.devtree_commit.outputs.commit }})
+          bootable/recovery commit: [${{ steps.recovery_commit.outputs.commit }}](https://github.com/AERA-Recovery/android_bootable_recovery/tree/${{ steps.recovery_commit.outputs.commit }})
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
