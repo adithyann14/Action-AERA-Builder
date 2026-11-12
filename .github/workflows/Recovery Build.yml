@@ -12,7 +12,7 @@ on:
       device_tree_branch:
         description: "Device tree branch"
         required: true
-        default: fox_16.0
+        default: Abort
         type: string
 
 jobs:
@@ -138,6 +138,61 @@ jobs:
         print("patched", f)
         PY
         grep -n -B2 -A10 "aera_panel_is_nvt()" "${{ env.SRC_DIR }}/bootable/recovery/aeraui/platform/aera_ui_host.cpp"
+
+    - name: AERA - rmtfs, dump the unknown request payload (diagnostic)
+      run: |
+        # The modem sends QMI request 7 to rmtfs and gets no reply. Print what it
+        # is (sender + first 64 bytes) instead of only "Unknown request: 7".
+        # Finds rmtfs.c wherever the manifest put it. No reply is sent.
+        python3 - <<'PY'
+        import os, re, sys
+        from pathlib import Path
+
+        root = Path("${{ env.SRC_DIR }}")
+        skip = {"out", ".repo", ".git"}
+        found = []
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if x not in skip]
+            if "rmtfs.c" in files:
+                p = Path(d) / "rmtfs.c"
+                if "[RMTFS] Unknown request" in p.read_text(errors="ignore"):
+                    found.append(p)
+        print("rmtfs.c candidates:", [str(p) for p in found])
+        if not found:
+            sys.exit("::error::no rmtfs.c with an 'Unknown request' message found in the tree")
+
+        pat = re.compile(
+            r'^([ \t]*)fprintf\(stderr,\s*"\[RMTFS\] Unknown request: %d\\n",\s*msg_id\);[ \t]*\n',
+            re.M)
+        for p in found:
+            s = p.read_text()
+            if "AERA_RMTFS_REQ_DUMP" in s:
+                print("already patched", p); continue
+            m = pat.search(s)
+            if not m:
+                print("lines mentioning Unknown request in", p)
+                for i, l in enumerate(s.split("\n"), 1):
+                    if "Unknown request" in l:
+                        print(f"  {i}: {l}")
+                sys.exit("::error::Unknown-request fprintf differs, update the patch")
+            ind = m.group(1)
+            new = (
+                f'{ind}/* AERA_RMTFS_REQ_DUMP */\n'
+                f'{ind}{{\n'
+                f'{ind}  size_t i, n = pkt.data_len < 64 ? pkt.data_len : 64;\n'
+                f'{ind}  fprintf(stderr, "[RMTFS] Unknown request: %d from %u:%u len=%zu data=",\n'
+                f'{ind}          msg_id, pkt.node, pkt.port, (size_t)pkt.data_len);\n'
+                f'{ind}  for (i = 0; i < n; i++)\n'
+                f'{ind}    fprintf(stderr, "%02x", ((const unsigned char *)pkt.data)[i]);\n'
+                f'{ind}  fprintf(stderr, "\\n");\n'
+                f'{ind}}}\n')
+            p.write_text(s[:m.start()] + new + s[m.end():])
+            print("patched", p)
+        PY
+        grep -rn -B2 -A9 "AERA_RMTFS_REQ_DUMP" "${{ env.SRC_DIR }}" \
+          --include=rmtfs.c --exclude-dir=out --exclude-dir=.repo
+
+
 
     - name: Get bootable/recovery commit
       id: recovery_commit
