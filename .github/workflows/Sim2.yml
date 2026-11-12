@@ -1,4 +1,4 @@
-name: Build AERA sky sim2
+name: Build AERA skysim2
 
 on:
   workflow_dispatch:
@@ -91,11 +91,37 @@ jobs:
             r'^([ \t]*)fprintf\(stderr,\s*"\[RMTFS\] Unknown request: %d\\n",\s*msg_id\);[ \t]*\n',
             re.M)
         getopt_anchor = '\twhile ((option = getopt(argc, argv, "o:S:Prsv")) != -1) {'
+        slot_anchor = 'static char slot_suffix[SLOT_SUFFIX_LEN];\n'
+        helper_c = (
+            '\n/* AERA_RMTFS_SINGLE_SIM: same rule as the stock rmt_storage (ODM request 7) */\n'
+            '#ifdef __ANDROID__\n'
+            '#include <sys/system_properties.h>\n'
+            '#endif\n'
+            '#ifndef PROP_VALUE_MAX\n'
+            '#define PROP_VALUE_MAX 92\n'
+            '#endif\n'
+            'static unsigned char aera_single_sim_tag(void)\n'
+            '{\n'
+            '\tchar multisim[PROP_VALUE_MAX + 1] = "", region[PROP_VALUE_MAX + 1] = "";\n'
+            '#ifdef __ANDROID__\n'
+            '\t__system_property_get("ro.boot.multisim", multisim);\n'
+            '\t__system_property_get("ro.miui.customized.region", region);\n'
+            '#endif\n'
+            '\tif (strncmp(multisim, "ssss", 4) == 0)\n'
+            '\t\treturn 1;\n'
+            '\treturn strncmp(region, "lm_cr", 5) == 0 ? 1 : 2;\n'
+            '}\n')
 
         for p in found:
             s = p.read_text()
 
-            # 1) request dump
+            if "AERA_RMTFS_SINGLE_SIM" not in s:
+                if s.count(slot_anchor) != 1:
+                    sys.exit("::error::slot_suffix anchor not found exactly once in " + str(p))
+                s = s.replace(slot_anchor, slot_anchor + helper_c, 1)
+                print("single-sim helper added", p)
+
+            # 1) request dump + reply
             if "AERA_RMTFS_REQ_DUMP" not in s:
                 m = pat.search(s)
                 if not m:
@@ -115,17 +141,14 @@ jobs:
                     f'{ind}    fprintf(stderr, "%02x", ((const unsigned char *)pkt.data)[i]);\n'
                     f'{ind}  fprintf(stderr, "\\n");\n'
                     f'{ind}  if (msg_id == 7 && pkt.data_len >= 3) {{\n'
-                    f'{ind}    /* EXPERIMENT: answer request 7 with an empty success response */\n'
-                    f'{ind}    const unsigned char *b = (const unsigned char *)pkt.data;\n'
-                    f'{ind}    struct rmtfs_close_resp ack = {{}};\n'
-                    f'{ind}    DEFINE_QRTR_PACKET(ack_buf, 256);\n'
-                    f'{ind}    unsigned ack_txn = b[1] | (b[2] << 8);\n'
-                    f'{ind}    ssize_t ack_len = qmi_encode_message(&ack_buf, QMI_RESPONSE, msg_id,\n'
-                    f'{ind}                                         ack_txn, &ack, rmtfs_close_resp_ei);\n'
-                    f'{ind}    if (ack_len >= 0) {{\n'
-                    f'{ind}      int r = qrtr_sendto(sock, pkt.node, pkt.port, ack_buf.data, ack_buf.data_len);\n'
-                    f'{ind}      fprintf(stderr, "[RMTFS] replied empty-success to request 7 (txn %u): %d\\n", ack_txn, r);\n'
-                    f'{ind}    }}\n'
+                    f'{ind}    /* Xiaomi/Wingtech ODM "get single sim tag" (stock rmt_storage handles it):\n'
+                    f'{ind}     * answer: result TLV 0x02 = success, optional TLV 0x10 (u8) = tag. */\n'
+                    f'{ind}    const unsigned char *rq = (const unsigned char *)pkt.data;\n'
+                    f'{ind}    unsigned char rsp[18] = {{0x02, rq[1], rq[2], 0x07, 0x00, 0x0b, 0x00,\n'
+                    f'{ind}                              0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,\n'
+                    f'{ind}                              0x10, 0x01, 0x00, aera_single_sim_tag()}};\n'
+                    f'{ind}    int r = qrtr_sendto(sock, pkt.node, pkt.port, rsp, sizeof(rsp));\n'
+                    f'{ind}    fprintf(stderr, "[RMTFS] replied to request 7 (single_sim_tag=%u): %d\\n", rsp[17], r);\n'
                     f'{ind}  }}\n'
                     f'{ind}}}\n')
                 s = s[:m.start()] + new + s[m.end():]
