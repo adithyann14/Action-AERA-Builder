@@ -1,4 +1,4 @@
-name: Build AERA sky
+name: Build AERA sky abort
 
 on:
   workflow_dispatch:
